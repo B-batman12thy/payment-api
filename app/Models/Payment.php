@@ -14,42 +14,47 @@ class Payment extends Model
         'description',
         'amount',
         'status',
-        'receipt_path',
         'category',
-        'processed_at',
+        'receipt_path',
+        'paid_at',
     ];
 
     protected $casts = [
-        'amount' => 'decimal:2',
-        'processed_at' => 'datetime',
+        'amount'  => 'decimal:2',
+        'paid_at' => 'datetime',
     ];
 
-    // Relationships
+    protected $appends = ['receipt_url', 'status_label', 'category_label'];
+
     public function user()
     {
         return $this->belongsTo(User::class);
     }
 
-    // Accessors
+    public function getReceiptUrlAttribute()
+    {
+        return $this->receipt_path ? url('storage/'.$this->receipt_path) : null;
+    }
+
     public function getStatusLabelAttribute()
     {
-        return match($this->status) {
-            'pending' => 'En attente',
-            'completed' => 'Terminé',
-            'failed' => 'Échoué',
-            default => 'Inconnu',
+        return match ($this->status) {
+            'PENDING' => 'En attente',
+            'SUCCESS' => 'Terminé',
+            'FAILED'  => 'Échoué',
+            default   => 'Inconnu',
         };
     }
 
     public function getCategoryLabelAttribute()
     {
-        return match($this->category) {
+        return match ($this->category) {
             'electricity' => 'Électricité',
-            'internet' => 'Internet',
-            'water' => 'Eau',
-            'rent' => 'Loyer',
-            'other' => 'Autre',
-            default => 'Autre',
+            'internet'    => 'Internet',
+            'water'       => 'Eau',
+            'rent'        => 'Loyer',
+            'other'       => 'Autre',
+            default       => 'Autre',
         };
     }
 }

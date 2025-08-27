@@ -3,141 +3,153 @@
 namespace App\Http\Controllers;
 
 use App\Models\Payment;
-use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 
 class PaymentController extends Controller
 {
-    public function __construct()
-    {
-        $this->middleware('auth:api');
-    }
-
-    public function dashboard()
-    {
-        $user = auth()->user();
-
-        // Paiements récents (5 derniers)
-        $recentPayments = $user->payments()
-            ->orderBy('created_at', 'desc')
-            ->limit(5)
-            ->get();
-
-        // Total des paiements du mois en cours
-        $monthlyTotal = $user->payments()
-            ->whereMonth('created_at', now()->month)
-            ->whereYear('created_at', now()->year)
-            ->where('status', 'completed')
-            ->sum('amount');
-
-        return response()->json([
-            'success' => true,
-            'data' => [
-                'user' => $user,
-                'balance' => $user->balance,
-                'recent_payments' => $recentPayments,
-                'monthly_total' => $monthlyTotal,
-            ]
-        ]);
-    }
-
+    // GET /api/payments?day=YYYY-MM-DD | ?month=YYYY-MM | ?year=YYYY
     public function index(Request $request)
     {
-        $user = auth()->user();
-        $payments = $user->payments()->orderBy('created_at', 'desc')->get();
+        $userId = auth('api')->id();
 
-        return response()->json([
-            'success' => true,
-            'data' => $payments
-        ]);
+        $q = Payment::where('user_id', $userId)->orderByDesc('created_at');
+
+        if ($day = $request->query('day')) {
+            $q->whereDate('created_at', $day);
+        } elseif ($month = $request->query('month')) {
+            $q->whereYear('created_at', substr($month, 0, 4))
+              ->whereMonth('created_at', substr($month, 5, 2));
+        } elseif ($year = $request->query('year')) {
+            $q->whereYear('created_at', $year);
+        }
+
+        return response()->json(['success' => true, 'data' => $q->get()]);
     }
 
+    // POST /api/payments (multipart si 'receipt')
     public function store(Request $request)
     {
-        $validator = Validator::make($request->all(), [
+        $userId = auth('api')->id();
+
+        $v = Validator::make($request->all(), [
             'description' => 'required|string|max:255',
-            'amount' => 'required|numeric|min:0.01',
-            'category' => 'required|string|in:electricity,internet,water,rent,other',
+            'amount'      => 'required|numeric|min:0.01',
+            'category'    => 'required|in:electricity,internet,water,rent,other',
+            'receipt'     => 'nullable|file|mimes:pdf,jpg,jpeg,png,webp|max:4096',
         ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Données invalides',
-                'errors' => $validator->errors()
-            ], 400);
+        if ($v->fails()) {
+            return response()->json(['success' => false, 'errors' => $v->errors()], 422);
         }
 
-        $user = auth()->user();
-        $amount = floatval($request->amount);
+        $path = $request->hasFile('receipt')
+            ? $request->file('receipt')->store('receipts', 'public')
+            : null;
 
-        // Vérifier le solde
-        if ($user->balance < $amount) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Solde insuffisant'
-            ], 400);
-        }
+        $status = ((float)$request->amount <= 500000)
+            ? 'SUCCESS'
+            : (rand(0, 1) ? 'SUCCESS' : 'FAILED');
 
-        // Simulation (80% de succès)
-        $status = rand(1, 10) <= 8 ? 'completed' : 'failed';
-
-        // Créer le paiement
         $payment = Payment::create([
-            'user_id' => $user->id,
-            'description' => $request->description,
-            'amount' => $amount,
-            'status' => $status,
-            'category' => $request->category,
-            'processed_at' => $status === 'completed' ? now() : null,
+            'user_id'      => $userId,
+            'description'  => $request->description,
+            'amount'       => $request->amount,
+            'category'     => $request->category,
+            'status'       => $status,
+            'paid_at'      => $status === 'SUCCESS' ? now() : null,
+            'receipt_path' => $path,
         ]);
 
-        // Décrémenter le solde si succès
-        if ($status === 'completed') {
-            $user->decrement('balance', $amount);
-            $user->refresh();
-        }
-
-        return response()->json([
-            'success' => true,
-            'message' => $status === 'completed' 
-                ? 'Paiement effectué avec succès' 
-                : 'Paiement échoué',
-            'payment' => $payment,
-            'new_balance' => $user->balance,
-        ], 201);
+        return response()->json(['success' => true, 'payment' => $payment->fresh()], 201);
     }
 
     public function show(Payment $payment)
     {
-        if ($payment->user_id !== auth()->id()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Paiement non trouvé'
-            ], 404);
+        $this->authorizeOwner($payment);
+        return response()->json(['success' => true, 'data' => $payment]);
+    }
+
+    public function downloadReceipt(Payment $payment)
+    {
+        $this->authorizeOwner($payment);
+
+        if (!$payment->receipt_path || !Storage::disk('public')->exists($payment->receipt_path)) {
+            return response()->json(['success' => false, 'message' => 'Aucun justificatif disponible'], 404);
         }
+
+        return response()->download(
+            Storage::disk('public')->path($payment->receipt_path),
+            basename($payment->receipt_path)
+        );
+    }
+
+    public function dashboard()
+    {
+        $u = auth('api')->user();
+
+        $recent = $u->payments()->orderByDesc('created_at')->limit(5)->get();
+
+        $monthlyTotal = (float) $u->payments()
+            ->where('status', 'SUCCESS')
+            ->whereYear('created_at', now()->year)
+            ->whereMonth('created_at', now()->month)
+            ->sum('amount');
+
+        $initial = 1000000.0;
+        $spent   = (float) $u->payments()->where('status', 'SUCCESS')->sum('amount');
+        $balance = max(0.0, $initial - $spent);
 
         return response()->json([
             'success' => true,
-            'payment' => $payment
+            'data' => [
+                'user'            => ['id' => $u->id, 'name' => $u->name, 'email' => $u->email],
+                'balance'         => round($balance, 2),
+                'recent_payments' => $recent,
+                'monthly_total'   => $monthlyTotal,
+            ],
         ]);
     }
 
     public function statistics()
     {
+        $u = auth('api')->user();
+
+        $byStatus = $u->payments()
+            ->selectRaw('status, COALESCE(SUM(amount),0) total')
+            ->groupBy('status')
+            ->pluck('total', 'status');
+
+        $byCategory = $u->payments()
+            ->where('status','SUCCESS')
+            ->selectRaw('category, COUNT(*) count, COALESCE(SUM(amount),0) total')
+            ->groupBy('category')
+            ->get();
+
+        $monthlyTotal = (float) $u->payments()
+            ->where('status','SUCCESS')
+            ->whereYear('created_at', now()->year)
+            ->whereMonth('created_at', now()->month)
+            ->sum('amount');
+
         return response()->json([
             'success' => true,
-            'message' => 'Statistiques disponibles'
+            'data' => [
+                'by_status' => [
+                    'PENDING' => (float) ($byStatus['PENDING'] ?? 0),
+                    'SUCCESS' => (float) ($byStatus['SUCCESS'] ?? 0),
+                    'FAILED'  => (float) ($byStatus['FAILED']  ?? 0),
+                ],
+                'by_category'   => $byCategory,
+                'monthly_total' => $monthlyTotal,
+            ],
         ]);
     }
 
-    public function downloadReceipt(Payment $payment)
+    private function authorizeOwner(Payment $payment): void
     {
-        return response()->json([
-            'success' => true,
-            'message' => 'Téléchargement de justificatif'
-        ]);
+        if ($payment->user_id !== auth('api')->id()) {
+            abort(response()->json(['success' => false, 'message' => 'Accès refusé'], 403));
+        }
     }
 }
